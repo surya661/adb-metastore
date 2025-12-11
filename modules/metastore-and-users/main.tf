@@ -29,74 +29,78 @@ locals {
   prefix                    = var.prefix
 }
 
-// Provider for databricks workspace
+# Provider for databricks workspace (workspace-scoped provider)
 provider "databricks" {
   host = local.databricks_workspace_host
+  # auth for this provider is inherited from environment or other config;
+  # set additional auth fields if needed (client_id/secret, azure_workspace_token, etc.)
 }
 
-// Create azure managed identity to be used by unity catalog metastore
+# Create azure managed identity to be used by unity catalog metastore
 resource "azurerm_databricks_access_connector" "unity" {
   name                = var.databricks_access_connector_name
   resource_group_name = data.azurerm_resource_group.this.name
   location            = data.azurerm_resource_group.this.location
-   identity {
+
+  identity {
     type         = var.access_connector_identity_type
-    identity_ids = var.identity_ids  # Only needed if type includes "UserAssigned"
+    identity_ids = var.identity_ids
   }
+
   tags = var.access_connector_tags
-   timeouts {
+
+  timeouts {
     create = "60m" # set to 60 minutes for creation
-    read   = "10m" # set to 10 minutes for read
-    update = "45m" # set to 45 minutes for update
-    delete = "40m" # set to 40 minutes for delete
+    read   = "10m"
+    update = "45m"
+    delete = "40m"
   }
 }
 
-// Create a storage account to be used by unity catalog metastore as root storage
+# Create a storage account to be used by unity catalog metastore as root storage
 module "unity_catalog_storage_account" {
   source  = "../storage-account"
   name    = var.storage_account_name
   location = data.azurerm_resource_group.this.location
   resource_group_name = data.azurerm_resource_group.this.name
 
-  # Add any additional variables your module expects
   account_tier             = var.storage_account_tier
   account_replication_type = var.storage_account_replication_type
   account_kind             = var.storage_account_kind
   access_tier              = var.storage_account_access_tier
   cross_tenant_replication_enabled  = var.cross_tenant_replication_enabled
   is_hns_enabled           = true
+
   log_analytics_workspace_name = var.log_analytics_workspace_name
   log_analytics_workspace_rg_name = var.log_analytics_workspace_rg_name
-
-  # Pass other optional variables as needed
 }
 
-// Create a container in storage account to be used by unity catalog metastore as root storage
+# Create a container in storage account to be used by unity catalog metastore as root storage
 resource "azurerm_storage_container" "unity_catalog" {
   name                  = "${local.prefix}-container"
-  storage_account_id    = module.unity_catalog_storage_account.storage_account_id 
+  storage_account_id    = module.unity_catalog_storage_account.storage_account_id
   container_access_type = "private"
 }
-// Assign the Storage Blob Data Contributor role to managed identity to allow unity catalog to access the storage
+
+# Assign the Storage Blob Data Contributor role to managed identity to allow unity catalog to access the storage
 resource "azurerm_role_assignment" "mi_data_contributor" {
-  scope                = module.unity_catalog_storage_account.storage_account_id  
-  role_definition_name = "Storage Blob Data Contributor"
+  scope                = module.unity_catalog_storage_account.storage_account_id
+  role_definition_name = var.storage_role_definition_name
   principal_id         = azurerm_databricks_access_connector.unity.identity[0].principal_id
 }
 
-// Create the first unity catalog metastore
+# Create the unity catalog metastore
 resource "databricks_metastore" "this" {
-  name = "primary"
+  name         = var.metastore_name
   storage_root = format("abfss://%s@%s.dfs.core.windows.net/",
     azurerm_storage_container.unity_catalog.name,
     module.unity_catalog_storage_account.storage_account_name
   )
-  force_destroy = true
-  owner         = "account_unity_admin"
+  force_destroy = var.force_destroy_metastore
+  owner         = var.metastore_owner
 }
 
-// Assign managed identity to metastore
+# Assign managed identity to metastore
 resource "databricks_metastore_data_access" "first" {
   metastore_id = databricks_metastore.this.id
   name         = "the-metastore-key"
@@ -106,7 +110,7 @@ resource "databricks_metastore_data_access" "first" {
   is_default = true
 }
 
-// Attach the databricks workspace to the metastore
+# Attach the databricks workspace to the metastore
 resource "databricks_metastore_assignment" "this" {
   workspace_id = local.databricks_workspace_id
   metastore_id = databricks_metastore.this.id
@@ -114,30 +118,29 @@ resource "databricks_metastore_assignment" "this" {
 
 resource "databricks_default_namespace_setting" "this" {
   namespace {
-    value = "main"
+    value = var.default_namespace
   }
 }
 
-
-// Initialize provider at Azure account-level
+# Initialize provider at Azure account-level (alias)
 provider "databricks" {
   alias      = "azure_account"
-  host       = "https://accounts.azuredatabricks.net"
+  host       = var.databricks_accounts_host
   account_id = var.account_id
-  auth_type  = "azure-cli"
+  auth_type  = var.account_auth_type
 }
 
 locals {
   aad_groups = toset(var.aad_groups)
 }
 
-// Read group members of given groups from AzureAD every time Terraform is started
+# Read group members of given groups from AzureAD every time Terraform is started
 data "azuread_group" "this" {
   for_each     = local.aad_groups
   display_name = each.value
 }
 
-// Add groups to databricks account
+# Add groups to databricks account
 resource "databricks_group" "this" {
   provider     = databricks.azure_account
   for_each     = data.azuread_group.this
@@ -150,7 +153,7 @@ locals {
   all_members = toset(flatten([for group in values(data.azuread_group.this) : group.members]))
 }
 
-// Extract information about real users
+# Extract information about real users
 data "azuread_users" "users" {
   ignore_missing = true
   object_ids     = local.all_members
@@ -162,7 +165,7 @@ locals {
   }
 }
 
-// All governed by AzureAD, create or remove users to/from databricks account
+# All governed by AzureAD, create or remove users to/from databricks account
 resource "databricks_user" "this" {
   provider                 = databricks.azure_account
   for_each                 = local.all_users
@@ -171,16 +174,14 @@ resource "databricks_user" "this" {
   active                   = local.all_users[each.key]["account_enabled"]
   external_id              = each.key
   force                    = true
-  disable_as_user_deletion = true # default behavior
+  disable_as_user_deletion = var.disable_as_user_deletion
 
-  // Review warning before deactivating or deleting users from databricks account
-  // https://learn.microsoft.com/en-us/azure/databricks/administration-guide/users-groups/scim/#add-users-and-groups-to-your-azure-databricks-account-using-azure-active-directory-azure-ad
   lifecycle {
     prevent_destroy = true
   }
 }
 
-// Extract information about service prinicpals users
+# Extract information about service principals
 data "azuread_service_principals" "spns" {
   object_ids = toset(setsubtract(local.all_members, data.azuread_users.users.object_ids))
 }
@@ -191,7 +192,7 @@ locals {
   }
 }
 
-// All governed by AzureAD, create or remove service to/from databricks account
+# All governed by AzureAD, create or remove service principals to/from databricks account
 resource "databricks_service_principal" "sp" {
   provider       = databricks.azure_account
   for_each       = local.all_spns
@@ -203,8 +204,9 @@ resource "databricks_service_principal" "sp" {
 }
 
 locals {
-  account_admin_members = toset(flatten([for group in values(data.azuread_group.this) : [group.display_name == "account_unity_admin" ? group.members : []]]))
+  account_admin_members = toset(flatten([for group in values(data.azuread_group.this) : [group.display_name == var.metastore_owner ? group.members : []]]))
 }
+
 # Extract information about real account admins users
 data "azuread_users" "account_admin_users" {
   ignore_missing = true
@@ -217,7 +219,7 @@ locals {
   }
 }
 
-// Making all users on account_unity_admin group as databricks account admin
+# Making all users on account_unity_admin (or the value of var.metastore_owner) group as databricks account admin
 resource "databricks_user_role" "account_admin" {
   provider   = databricks.azure_account
   for_each   = local.all_account_admin_users
